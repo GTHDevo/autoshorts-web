@@ -1,0 +1,7 @@
+flask
+yt-dlp
+moviepy==1.0.3
+faster-whisper
+ffmpeg-python
+gunicorn
+numpy
