@@ -2,10 +2,11 @@ import os
 import uuid
 import yt_dlp
 import subprocess
-from flask import Flask, request, send_file, jsonify
-from faster_whisper import WhisperModel
-from moviepy.editor import VideoFileClip, concatenate_videoclips
 import numpy as np
+
+from flask import Flask, request, jsonify, send_file
+from moviepy.editor import VideoFileClip
+from faster_whisper import WhisperModel
 
 app = Flask(__name__)
 
@@ -15,9 +16,18 @@ OUTPUT_FOLDER = "outputs"
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
-# -----------------------
+# -----------------------------------
+# HOOK WORDS (viral scoring için)
+# -----------------------------------
+HOOK_WORDS = [
+    "şok", "inanılmaz", "kimse", "asla",
+    "gerçek", "inanamıyorum", "nasıl",
+    "neden", "beklenmedik", "tarihi"
+]
+
+# -----------------------------------
 # VIDEO DOWNLOAD
-# -----------------------
+# -----------------------------------
 def download_video(url):
     filename = str(uuid.uuid4()) + ".mp4"
     filepath = os.path.join(DOWNLOAD_FOLDER, filename)
@@ -33,127 +43,184 @@ def download_video(url):
 
     return filepath
 
-# -----------------------
-# SILENCE CUT
-# -----------------------
-def cut_silence(video_path):
-    video = VideoFileClip(video_path)
-    audio = video.audio
+# -----------------------------------
+# VIRAL 45 SECOND FINDER
+# -----------------------------------
+def find_viral_segment(segments, window=45):
+    best_score = 0
+    best_start = 0
 
-    threshold = 0.03
-    window = 0.1
-    intervals = []
+    for i in range(len(segments)):
+        start_time = segments[i].start
+        end_time = start_time + window
 
-    speaking = False
-    start = 0
+        score = 0
 
-    for t in np.arange(0, audio.duration, window):
-        sub = audio.subclip(t, min(t + window, audio.duration))
-        if sub.max_volume() > threshold:
-            if not speaking:
-                speaking = True
-                start = t
-        else:
-            if speaking:
-                speaking = False
-                intervals.append((start, t))
+        for seg in segments:
+            if seg.start >= start_time and seg.end <= end_time:
+                text = seg.text.lower()
 
-    if speaking:
-        intervals.append((start, audio.duration))
+                if "!" in text:
+                    score += 2
+                if "?" in text:
+                    score += 2
 
-    clips = [video.subclip(s, e) for s, e in intervals]
-    final = concatenate_videoclips(clips)
+                for word in HOOK_WORDS:
+                    if word in text:
+                        score += 3
 
-    output_path = os.path.join(OUTPUT_FOLDER, str(uuid.uuid4()) + "_cut.mp4")
-    final.write_videofile(output_path, codec="libx264", audio_codec="aac")
+                score += len(text.split()) * 0.05
 
-    video.close()
-    return output_path
+        if score > best_score:
+            best_score = score
+            best_start = start_time
 
-# -----------------------
-# AUTO SUBTITLE
-# -----------------------
-def add_subtitles(video_path):
-    model = WhisperModel("base", compute_type="int8")
-    segments, _ = model.transcribe(video_path)
+    return best_start, best_start + window
 
-    srt_path = video_path.replace(".mp4", ".srt")
+# -----------------------------------
+# TITLE GENERATOR
+# -----------------------------------
+def generate_title(full_text):
+    sentences = full_text.split(".")
+    longest = max(sentences, key=len).strip()
 
-    with open(srt_path, "w", encoding="utf-8") as f:
-        for i, segment in enumerate(segments):
-            f.write(f"{i+1}\n")
-            f.write(f"{format_time(segment.start)} --> {format_time(segment.end)}\n")
-            f.write(segment.text + "\n\n")
+    title = longest.capitalize()
 
-    output_path = video_path.replace(".mp4", "_sub.mp4")
+    if len(title) > 80:
+        title = title[:77] + "..."
 
-    subprocess.run([
-        "ffmpeg", "-i", video_path,
-        "-vf", "subtitles=" + srt_path,
-        output_path
-    ])
+    return title
 
-    return output_path
-
+# -----------------------------------
+# SRT TIME FORMAT
+# -----------------------------------
 def format_time(seconds):
     h = int(seconds // 3600)
     m = int((seconds % 3600) // 60)
     s = seconds % 60
     return f"{h:02}:{m:02}:{s:06.3f}".replace('.', ',')
 
-# -----------------------
-# 9:16 FORMAT
-# -----------------------
-def make_vertical(video_path):
-    output_path = video_path.replace(".mp4", "_vertical.mp4")
-
-    subprocess.run([
-        "ffmpeg", "-i", video_path,
-        "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920",
-        "-preset", "ultrafast",
-        output_path
-    ])
-
-    return output_path
-
-# -----------------------
-# ROUTE
-# -----------------------
+# -----------------------------------
+# MAIN ROUTE
+# -----------------------------------
 @app.route("/generate", methods=["POST"])
 def generate():
-    url = request.json.get("url")
+    data = request.get_json()
+    url = data.get("url")
 
     if not url:
         return jsonify({"error": "URL gerekli"}), 400
 
-    video = download_video(url)
-    cut = cut_silence(video)
-    sub = add_subtitles(cut)
-    vertical = make_vertical(sub)
+    try:
+        # 1️⃣ Download
+        video_path = download_video(url)
 
-    return send_file(vertical, as_attachment=True)
+        # 2️⃣ Whisper transcript
+        model = WhisperModel("base", compute_type="int8")
+        segments, _ = model.transcribe(video_path)
+        segments = list(segments)
 
+        if not segments:
+            return jsonify({"error": "Transcript alınamadı"}), 500
+
+        # 3️⃣ Viral segment seç
+        start, end = find_viral_segment(segments)
+
+        clip = VideoFileClip(video_path).subclip(start, end)
+
+        viral_path = os.path.join(
+            OUTPUT_FOLDER,
+            str(uuid.uuid4()) + "_viral.mp4"
+        )
+
+        clip.write_videofile(
+            viral_path,
+            codec="libx264",
+            audio_codec="aac"
+        )
+
+        # 4️⃣ Altyazı oluştur
+        srt_path = viral_path.replace(".mp4", ".srt")
+
+        with open(srt_path, "w", encoding="utf-8") as f:
+            for i, seg in enumerate(segments):
+                if seg.start >= start and seg.end <= end:
+                    f.write(f"{i+1}\n")
+                    f.write(
+                        f"{format_time(seg.start-start)} --> "
+                        f"{format_time(seg.end-start)}\n"
+                    )
+                    f.write(seg.text + "\n\n")
+
+        subtitled_path = viral_path.replace(".mp4", "_sub.mp4")
+
+        subprocess.run([
+            "ffmpeg",
+            "-i", viral_path,
+            "-vf", f"subtitles={srt_path}",
+            subtitled_path
+        ])
+
+        # 5️⃣ 9:16 format
+        vertical_path = subtitled_path.replace(".mp4", "_vertical.mp4")
+
+        subprocess.run([
+            "ffmpeg",
+            "-i", subtitled_path,
+            "-vf",
+            "scale=1080:1920:force_original_aspect_ratio=increase,"
+            "crop=1080:1920",
+            "-preset", "ultrafast",
+            vertical_path
+        ])
+
+        # 6️⃣ Başlık üret
+        full_text = " ".join([seg.text for seg in segments])
+        title = generate_title(full_text)
+
+        return jsonify({
+            "title": title,
+            "download_url": "/download/" + os.path.basename(vertical_path)
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# -----------------------------------
+# DOWNLOAD ROUTE
+# -----------------------------------
+@app.route("/download/<filename>")
+def download(filename):
+    path = os.path.join(OUTPUT_FOLDER, filename)
+    return send_file(path, as_attachment=True)
+
+# -----------------------------------
+# SIMPLE HOME UI
+# -----------------------------------
 @app.route("/")
 def home():
     return """
-    <h2>AutoShorts Generator</h2>
-    <form method="post" action="/generate" onsubmit="event.preventDefault(); send();">
-    <input id="url" placeholder="YouTube Link" style="width:300px"/>
-    <button type="submit">Generate</button>
-    </form>
+    <h2>AutoShorts AI Generator</h2>
+    <input id='url' placeholder='YouTube Link' style='width:300px'/>
+    <button onclick='generate()'>Generate</button>
+    <p id='result'></p>
     <script>
-    async function send(){
+    async function generate(){
         let url = document.getElementById('url').value;
         let res = await fetch('/generate', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
             body: JSON.stringify({url:url})
         });
-        let blob = await res.blob();
-        let a = document.createElement('a');
-        a.href = URL.createObjectURL(blob);
-        a.download = "short.mp4";
-        a.click();
+        let data = await res.json();
+
+        if(data.error){
+            document.getElementById('result').innerText = data.error;
+        }else{
+            document.getElementById('result').innerHTML =
+            "<b>Title:</b> "+data.title+
+            "<br><a href='"+data.download_url+"'>Download Video</a>";
+        }
     }
     </script>
     """
